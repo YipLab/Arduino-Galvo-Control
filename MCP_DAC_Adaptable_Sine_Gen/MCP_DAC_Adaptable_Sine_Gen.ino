@@ -67,7 +67,7 @@ void setup() {
   dac1.begin(dac1_CS);
   dac2.begin(dac2_CS);
   
-  // Initialize trigger pin
+  // Initialize trigger pin for TTL output
   pinMode(TRIGGER_PIN, OUTPUT);
   digitalWrite(TRIGGER_PIN, LOW);
   
@@ -87,14 +87,17 @@ void setup() {
   
 void loop() {
   for(int i=0; i<maxSamplesNum; i++) {
-    // Generate trigger pulse
-    digitalWrite(TRIGGER_PIN, HIGH);
-    
+
     // Update both DACs
     dac1.write(YArray12[i]);
     dac2.write(XArray12[i]);
-    
+
+    // Generate TTL trigger pulse
+    digitalWrite(TRIGGER_PIN, HIGH);  
+    delayMicroseconds(12);             // Maintain pulse width
     digitalWrite(TRIGGER_PIN, LOW);
+    delayMicroseconds(6); // Short delay to ensure trigger pulse is registered
+
     delayMicroseconds(msDelay);
     
     // Check for serial commands after completing a full cycle
@@ -142,10 +145,14 @@ void readSerial(float *scalex, float *scaley, int *msdelay, int *centreX, int *c
     char nextChar = Serial.read();
     if (nextChar == 'c')  {
       // Set center position (12-bit values)
-      digitalWrite(TRIGGER_PIN, HIGH);
       dac1.write(*centreY);
       dac2.write(*centreX);
-      digitalWrite(TRIGGER_PIN, LOW);
+
+      digitalWrite(TRIGGER_PIN, HIGH);             // Rising edge
+      delayMicroseconds(12);             // Maintain pulse width
+      digitalWrite(TRIGGER_PIN, LOW);              // Falling edge
+      delayMicroseconds(6); // Short delay to ensure trigger pulse is registered
+
       Serial.println("Laser at Center, press q to quit");
 
       char quit = ' ';
@@ -162,10 +169,14 @@ void readSerial(float *scalex, float *scaley, int *msdelay, int *centreX, int *c
       float yVal = *centreY;  // (128-128) term zeroed
       float xVal = (255 - 128) * (*scalex) * 4 + *centreX;
       
-      digitalWrite(TRIGGER_PIN, HIGH);
       dac1.write(static_cast<uint16_t>(constrain(yVal, 0, 4095)));
       dac2.write(static_cast<uint16_t>(constrain(xVal, 0, 4095)));
-      digitalWrite(TRIGGER_PIN, LOW);
+
+      digitalWrite(TRIGGER_PIN, HIGH);             // Rising edge
+      delayMicroseconds(12);             // Maintain pulse width
+      digitalWrite(TRIGGER_PIN, LOW);              // Falling edge
+      delayMicroseconds(6); // Short delay to ensure trigger pulse is registered
+
       Serial.println("Laser at normal TIRF, press q to quit");
  
       char quit = ' ';
