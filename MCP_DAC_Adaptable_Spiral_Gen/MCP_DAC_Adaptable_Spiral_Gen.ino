@@ -13,13 +13,27 @@ MCP4921 dac1;         // DAC for Y-axis
 MCP4921 dac2;         // DAC for X-axis
 #define TRIGGER_PIN 8  // Digital trigger output pin
 #define FRACTIONAL_BITS 10  // Fixed-point fractional resolution (10 bits = 1024)
-#define FIXED_SCALE (1 << FRACTIONAL_BITS)  // Fixed-point scaling factor
+// #define FIXED_SCALE (1 << (FRACTIONAL_BITS-5))  // Fixed-point scaling factor for using op amp
+#define FIXED_SCALE (1 << (FRACTIONAL_BITS))  // Fixed-point scaling factor for without op amp
 
 const uint16_t maxSamplesNum = 310;  // Number of points per cycle
+const uint16_t maxSineNum = 79;
 
 // Chip select pins
 const byte dac1_CS = 10;  // DAC1 (Y-axis)
 const byte dac2_CS = 9;   // DAC2 (X-axis)
+
+// Control parameters
+int32_t scaleX_fixed = FIXED_SCALE;  // Fixed-point X scale (1.0 = 1024)
+int32_t scaleY_fixed = FIXED_SCALE;  // Fixed-point Y scale (1.0 = 1024)
+int centreX = 2048;  // 12-bit center value
+int centreY = 2048;  // 12-bit center value
+uint16_t msDelay = 10;  // milisecond delay between points
+uint16_t usDelay = 0;  // Additional microsecond delay between points
+
+uint16_t wavefromTruncationIdx = maxSamplesNum;
+bool isFullWaveform = true;
+bool isSingleRunFull = false;
 
 // Base waveforms stored in PROGMEM (flash memory)
 const uint16_t baseX[maxSamplesNum] PROGMEM = {
@@ -86,12 +100,6 @@ const uint16_t baseY[maxSamplesNum] PROGMEM = {
   2275, 2113
 };
 
-// Control parameters
-int32_t scaleX_fixed = FIXED_SCALE;  // Fixed-point X scale (1.0 = 1024)
-int32_t scaleY_fixed = FIXED_SCALE;  // Fixed-point Y scale (1.0 = 1024)
-int centreX = 2048;  // 12-bit center value
-int centreY = 2048;  // 12-bit center value
-uint16_t msDelay = 5000;  // Microsecond delay between points
 
 void setup() {
   SPI.begin();
@@ -108,33 +116,71 @@ void setup() {
 }
 
 void loop() {
-  for(uint16_t i = 0; i < maxSamplesNum; i++) {
-    // Read base values from PROGMEM
-    uint16_t baseX_val = pgm_read_word_near(&baseX[i]);
-    uint16_t baseY_val = pgm_read_word_near(&baseY[i]);
-    
-    // Compute scaled values using fixed-point arithmetic
-    uint16_t dacX = computeDACValue(baseX_val, scaleX_fixed, centreX);
-    uint16_t dacY = computeDACValue(baseY_val, scaleY_fixed, centreY);
-    
-    // Update DACs
-    dac1.write(dacY);
-    dac2.write(dacX);
-    
-    // Generate precise trigger pulse
-    digitalWrite(TRIGGER_PIN, HIGH);
-    delayMicroseconds(12);  // Maintain pulse width
-    digitalWrite(TRIGGER_PIN, LOW);
-    delayMicroseconds(6);   // Inter-pulse delay
-    
-    // Apply user-defined delay
-    if(msDelay) delayMicroseconds(msDelay);
+
+  if (isSingleRunFull) {
+    runFullWaveformOnce();     // exactly one 310-point cycle
+    setCenterPosition();       // returns after user presses 'q'
+    isSingleRunFull = false;     // clear request
+    // After exiting center (user pressed 'q'), fall through to normal operation
   }
+  runFullWaveformOnce();
+  
+  // wavefromTruncationIdx =  isFullWaveform ? maxSamplesNum : maxSineNum;
+
+  // for(uint16_t i = 0; i < wavefromTruncationIdx; i++) {
+  //   // Read base values from PROGMEM
+  //   uint16_t baseX_val = pgm_read_word_near(&baseX[i]);
+  //   uint16_t baseY_val = pgm_read_word_near(&baseY[i]);
+    
+  //   // Compute scaled values using fixed-point arithmetic
+  //   uint16_t dacX = computeDACValue(baseX_val, scaleX_fixed, centreX);
+  //   uint16_t dacY = computeDACValue(baseY_val, scaleY_fixed, centreY);
+    
+  //   // Update DACs
+  //   dac1.write(dacY);
+  //   dac2.write(dacX);
+    
+  //   // Generate precise trigger pulse
+  //   digitalWrite(TRIGGER_PIN, HIGH);
+  //   delayMicroseconds(12);  // Maintain pulse width
+  //   digitalWrite(TRIGGER_PIN, LOW);
+  //   delayMicroseconds(6);   // Inter-pulse delay
+    
+  //   // Apply user-defined delay
+  //   if(msDelay) {delay(msDelay); delayMicroseconds(usDelay);}
+  // }
+  
 
   // Handle serial commands at end of cycle
   if(Serial.available()) {
     processSerialCommands();
   }
+}
+
+void runFullWaveformOnce() {
+  
+  // Choose to either run full spiral or just run simple sinewave for checking bounds
+  wavefromTruncationIdx = isFullWaveform ? maxSamplesNum : maxSineNum;
+
+  // Serial.println("Single full waveform run (s) started...");
+  for (uint16_t i = 0; i < wavefromTruncationIdx; i++) {
+    uint16_t baseX_val = pgm_read_word_near(&baseX[i]);
+    uint16_t baseY_val = pgm_read_word_near(&baseY[i]);
+
+    uint16_t dacX = computeDACValue(baseX_val, scaleX_fixed, centreX);
+    uint16_t dacY = computeDACValue(baseY_val, scaleY_fixed, centreY);
+
+    dac1.write(dacY);
+    dac2.write(dacX);
+
+    digitalWrite(TRIGGER_PIN, HIGH);
+    delayMicroseconds(12);
+    digitalWrite(TRIGGER_PIN, LOW);
+    delayMicroseconds(6);
+
+    if (msDelay) { delay(msDelay); delayMicroseconds(usDelay); }
+  }
+  // Serial.println("Single full waveform run complete; centering...");
 }
 
 // Compute DAC value using fixed-point arithmetic
@@ -164,6 +210,22 @@ void processSerialCommands() {
     case 'p':  // Normal TIRF position
       setTIRFPosition();
       break;
+    
+    case 'f':  // Full waveform
+      Serial.println("Full waveform/spiral");
+      isFullWaveform = 1;
+      break;
+
+    case 't':  // truncated sine pattern from full waaveform
+      Serial.println("Trunc waveform/sine");
+      isFullWaveform = 0;
+      break;
+
+    case 's': // run full waveform one time, then set to center, press q to quit this run
+      // setCenterPosition();
+      isSingleRunFull = true;
+      Serial.println("Scheduled single full waveform run, then center.");
+      break;
       
     case 'x':  // X scaling
       scaleX_fixed = readFloatFromSerial() * FIXED_SCALE;
@@ -177,12 +239,18 @@ void processSerialCommands() {
       Serial.println((float)scaleY_fixed / FIXED_SCALE);
       break;
       
-    case 'd':  // Delay setting
+    case 'm':  // Delay setting ms
       msDelay = readIntFromSerial();
-      Serial.print("Delay set to: ");
+      Serial.print("ms Delay set to: ");
       Serial.println(msDelay);
       break;
       
+    case 'u':  // Delay setting us
+      usDelay = readIntFromSerial();
+      Serial.print("us Delay set to: ");
+      Serial.println(usDelay);
+      break;
+
     case '^':  // Y shift
       centreY = constrain(centreY + readIntFromSerial(), 0, 4095);
       Serial.print("Y centre: ");
@@ -200,6 +268,7 @@ void processSerialCommands() {
       Serial.println(command);
   }
 }
+
 
 void setCenterPosition() {
   digitalWrite(TRIGGER_PIN, HIGH);
