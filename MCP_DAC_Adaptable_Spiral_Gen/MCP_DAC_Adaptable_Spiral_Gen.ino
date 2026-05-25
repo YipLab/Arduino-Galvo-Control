@@ -1,27 +1,47 @@
-/*____________SineGenNoPWM - Memory Optimized DAC Version__________________________________
+/*____________SineGen - Memory Optimized & Non-Blocking DAC Version__________
  * Optimized for memory efficiency with:
  * - Base waveforms stored in PROGMEM (flash memory)
  * - On-the-fly computation using fixed-point arithmetic
  * - 12-bit native values with 310-point arrays
  * - Precise trigger timing for synchronization
+ * - Non-Blocking mode execution using millis()
+ * - Support for Single MCP4922 or Dual MCP4921s via compiler flag
  */
 
-#include "MCP_DAC.h"  // Include DAC library
-#include <avr/pgmspace.h>  // For PROGMEM
+#include <SPI.h>
+#include <avr/pgmspace.h>
 
-MCP4921 dac1;         // DAC for Y-axis
-MCP4921 dac2;         // DAC for X-axis
+// Uncomment the following line to use a single MCP4922 instead of dual MCP4921s
+// #define USE_MCP4922
+
+#ifndef USE_MCP4922
+  #include "MCP_DAC.h"
+  MCP4921 dac1;         // DAC for Y-axis
+  MCP4921 dac2;         // DAC for X-axis
+  const byte dac1_CS = 10;  // DAC1 (Y-axis)
+  const byte dac2_CS = 9;   // DAC2 (X-axis)
+#else
+  // Faster standalone MCP4922 code
+  #define MCP4922_CS_PIN 10
+  void mcp4922(uint16_t value, uint8_t channel)  //  channel = 0, 1
+  {
+    uint16_t data = 0x3000 | value;
+    if (channel == 1) data |= 0x8000;
+    digitalWrite(MCP4922_CS_PIN, LOW);
+    SPI.beginTransaction(SPISettings(16000000, MSBFIRST, SPI_MODE0));
+    SPI.transfer((uint8_t)(data >> 8));
+    SPI.transfer((uint8_t)(data & 0xFF));
+    SPI.endTransaction();
+    digitalWrite(MCP4922_CS_PIN, HIGH);
+  }
+#endif
+
 #define TRIGGER_PIN 8  // Digital trigger output pin
 #define FRACTIONAL_BITS 10  // Fixed-point fractional resolution (10 bits = 1024)
-// #define FIXED_SCALE (1 << (FRACTIONAL_BITS-5))  // Fixed-point scaling factor for using op amp
 #define FIXED_SCALE (1 << (FRACTIONAL_BITS))  // Fixed-point scaling factor for without op amp
 
 const uint16_t maxSamplesNum = 310;  // Number of points per cycle
 const uint16_t maxSineNum = 79;
-
-// Chip select pins
-const byte dac1_CS = 10;  // DAC1 (Y-axis)
-const byte dac2_CS = 9;   // DAC2 (X-axis)
 
 // Control parameters
 int32_t scaleX_fixed = FIXED_SCALE;  // Fixed-point X scale (1.0 = 1024)
@@ -33,7 +53,14 @@ uint16_t usDelay = 0;  // Additional microsecond delay between points
 
 uint16_t wavefromTruncationIdx = maxSamplesNum;
 bool isFullWaveform = true;
-bool isSingleRunFull = false;
+
+// State Variables for non-blocking delay
+enum ScanMode { MODE_SCAN, MODE_FIXED };
+ScanMode currentMode = MODE_FIXED;
+
+unsigned long lastUpdateMillis = 0;
+long singleRunRemaining = 0; // >0: steps remaining, -1: infinite
+int scan_base_pointer = 0;
 
 // Base waveforms stored in PROGMEM (flash memory)
 const uint16_t baseX[maxSamplesNum] PROGMEM = {
@@ -100,87 +127,117 @@ const uint16_t baseY[maxSamplesNum] PROGMEM = {
   2275, 2113
 };
 
-
 void setup() {
   SPI.begin();
+#ifndef USE_MCP4922
   // Initialize DACs
   dac1.begin(dac1_CS);
   dac2.begin(dac2_CS);
+#else
+  pinMode(MCP4922_CS_PIN, OUTPUT);
+  digitalWrite(MCP4922_CS_PIN, HIGH);
+#endif
   
   // Initialize trigger pin
   pinMode(TRIGGER_PIN, OUTPUT);
   digitalWrite(TRIGGER_PIN, LOW);
   
   Serial.begin(9600);
-  setCenterPosition();
+  Serial.println("MCP DAC Ready.");
+  printHelp();
+  
+  enterFixedMode();
 }
 
 void loop() {
-
-  if (isSingleRunFull) {
-    runFullWaveformOnce();     // exactly one 310-point cycle
-    setCenterPosition();       // returns after user presses 'q'
-    isSingleRunFull = false;     // clear request
-    // After exiting center (user pressed 'q'), fall through to normal operation
-  }
-  runFullWaveformOnce();
-  
-  // wavefromTruncationIdx =  isFullWaveform ? maxSamplesNum : maxSineNum;
-
-  // for(uint16_t i = 0; i < wavefromTruncationIdx; i++) {
-  //   // Read base values from PROGMEM
-  //   uint16_t baseX_val = pgm_read_word_near(&baseX[i]);
-  //   uint16_t baseY_val = pgm_read_word_near(&baseY[i]);
-    
-  //   // Compute scaled values using fixed-point arithmetic
-  //   uint16_t dacX = computeDACValue(baseX_val, scaleX_fixed, centreX);
-  //   uint16_t dacY = computeDACValue(baseY_val, scaleY_fixed, centreY);
-    
-  //   // Update DACs
-  //   dac1.write(dacY);
-  //   dac2.write(dacX);
-    
-  //   // Generate precise trigger pulse
-  //   digitalWrite(TRIGGER_PIN, HIGH);
-  //   delayMicroseconds(12);  // Maintain pulse width
-  //   digitalWrite(TRIGGER_PIN, LOW);
-  //   delayMicroseconds(6);   // Inter-pulse delay
-    
-  //   // Apply user-defined delay
-  //   if(msDelay) {delay(msDelay); delayMicroseconds(usDelay);}
-  // }
-  
-
-  // Handle serial commands at end of cycle
   if(Serial.available()) {
     processSerialCommands();
   }
+  runDACs();
 }
 
-void runFullWaveformOnce() {
-  
-  // Choose to either run full spiral or just run simple sinewave for checking bounds
+void writeDACs(uint16_t dacX, uint16_t dacY) {
+#ifndef USE_MCP4922
+  dac1.write(dacY);
+  dac2.write(dacX);
+#else
+  mcp4922(dacY, 0); // Channel 0 is Y-axis
+  mcp4922(dacX, 1); // Channel 1 is X-axis
+#endif
+}
+
+void triggerDevice() {
+  delayMicroseconds(100); // Settling delay
+  digitalWrite(TRIGGER_PIN, HIGH);
+  delayMicroseconds(12);
+  digitalWrite(TRIGGER_PIN, LOW);
+  if (usDelay > 0) delayMicroseconds(usDelay);
+}
+
+void runDACs() {
+  if (currentMode == MODE_FIXED) {
+    delay(10);
+    // Fixed mode maintains the position, but we don't continuously spam the trigger
+    return;
+  }
+
+  if (millis() - lastUpdateMillis >= msDelay) {
+    lastUpdateMillis = millis();
+
+    if (singleRunRemaining > 0 || singleRunRemaining == -1) {
+      stepDAC();
+    } else if (singleRunRemaining == -2) {
+       // Last step finished its delay duration, now enter fixed mode
+       enterFixedMode();
+       singleRunRemaining = 0;
+    }
+  }
+}
+
+void stepDAC() {
   wavefromTruncationIdx = isFullWaveform ? maxSamplesNum : maxSineNum;
 
-  // Serial.println("Single full waveform run (s) started...");
-  for (uint16_t i = 0; i < wavefromTruncationIdx; i++) {
-    uint16_t baseX_val = pgm_read_word_near(&baseX[i]);
-    uint16_t baseY_val = pgm_read_word_near(&baseY[i]);
+  uint16_t baseX_val = pgm_read_word_near(&baseX[scan_base_pointer]);
+  uint16_t baseY_val = pgm_read_word_near(&baseY[scan_base_pointer]);
 
-    uint16_t dacX = computeDACValue(baseX_val, scaleX_fixed, centreX);
-    uint16_t dacY = computeDACValue(baseY_val, scaleY_fixed, centreY);
+  uint16_t dacX = computeDACValue(baseX_val, scaleX_fixed, centreX);
+  uint16_t dacY = computeDACValue(baseY_val, scaleY_fixed, centreY);
 
-    dac1.write(dacY);
-    dac2.write(dacX);
+  writeDACs(dacX, dacY);
+  triggerDevice();
 
-    digitalWrite(TRIGGER_PIN, HIGH);
-    delayMicroseconds(12);
-    digitalWrite(TRIGGER_PIN, LOW);
-    delayMicroseconds(6);
-
-    if (msDelay) { delay(msDelay); delayMicroseconds(usDelay); }
+  scan_base_pointer++;
+  if (scan_base_pointer >= wavefromTruncationIdx) {
+    scan_base_pointer = 0;
   }
-  // Serial.println("Single full waveform run complete; centering...");
+
+  if (singleRunRemaining > 0) {
+    singleRunRemaining--;
+    if (singleRunRemaining <= 0) {
+      singleRunRemaining = -2; // Wait one cycle before entering fixed mode
+    }
+  }
+}
+
+void enterFixedMode() {
+  currentMode = MODE_FIXED;
+  singleRunRemaining = 0;
+  writeDACs(centreX, centreY);
+  digitalWrite(TRIGGER_PIN, HIGH);
+  delayMicroseconds(12);
+  digitalWrite(TRIGGER_PIN, LOW);
+  Serial.println("Laser at Center (Fixed mode)");
+}
+
+void setTIRFPosition() {
+  currentMode = MODE_FIXED;
+  singleRunRemaining = 0;
+  uint16_t tirfY = computeDACValue(4095, scaleY_fixed, centreY);
+  writeDACs(centreX, tirfY);
+  digitalWrite(TRIGGER_PIN, HIGH);
+  delayMicroseconds(12);
+  digitalWrite(TRIGGER_PIN, LOW);
+  Serial.println("Laser at TIRF position (Fixed mode)");
 }
 
 // Compute DAC value using fixed-point arithmetic
@@ -199,133 +256,157 @@ uint16_t computeDACValue(uint16_t base, int32_t scale_fixed, int centre) {
 }
 
 void processSerialCommands() {
-  char command = Serial.read();
-  String input;
+  String data;
+  while(Serial.available()) {
+    data += (char)Serial.read();
+    delay(2);
+  }
+  if (data.length() == 0) return;
+
+  int idx = 0;
+  int len = data.length();
   
-  switch(command) {
-    case 'c':  // Center position
-      setCenterPosition();
-      break;
-      
-    case 'p':  // Normal TIRF position
+  // Quick parse char by char for commands
+  while(idx < len) {
+    char cmd = data[idx];
+    if (isWhitespace(cmd)) { idx++; continue; }
+
+    if (cmd == 'c') { enterFixedMode(); idx++; }
+    else if (cmd == 'q') { enterFixedMode(); idx++; }
+    else if (cmd == 'p') {
+      idx++;
+      String floatStr = "";
+      while(idx < len && (isDigit(data[idx]) || data[idx]=='.' || data[idx]=='-')) {
+        floatStr += data[idx];
+        idx++;
+      }
+      if (floatStr.length() > 0) {
+        scaleY_fixed = floatStr.toFloat() * FIXED_SCALE;
+        Serial.print("TIRF Y scale set to: "); Serial.println((float)scaleY_fixed / FIXED_SCALE);
+      }
       setTIRFPosition();
-      break;
-    
-    case 'f':  // Full waveform
-      Serial.println("Full waveform/spiral");
-      isFullWaveform = 1;
-      break;
-
-    case 't':  // truncated sine pattern from full waaveform
-      Serial.println("Trunc waveform/sine");
-      isFullWaveform = 0;
-      break;
-
-    case 's': // run full waveform one time, then set to center, press q to quit this run
-      // setCenterPosition();
-      isSingleRunFull = true;
-      Serial.println("Scheduled single full waveform run, then center.");
-      break;
+    }
+    else if (cmd == 'o') { singleRunRemaining = -1; currentMode = MODE_SCAN; Serial.println("Infinite Run (q to quit)."); idx++; }
+    else if (cmd == 's') { 
+      // check if it has a value attached
+      idx++;
+      long steps = 0;
+      bool hasVal = false;
+      while(idx < len && isDigit(data[idx])) {
+        hasVal = true;
+        steps = steps * 10 + (data[idx] - '0');
+        idx++;
+      }
+      if (!hasVal) steps = isFullWaveform ? maxSamplesNum : maxSineNum; // Full cycle
       
-    case 'x':  // X scaling
-      scaleX_fixed = readFloatFromSerial() * FIXED_SCALE;
-      Serial.print("X scale set to: ");
-      Serial.println((float)scaleX_fixed / FIXED_SCALE);
-      break;
-      
-    case 'y':  // Y scaling
-      scaleY_fixed = readFloatFromSerial() * FIXED_SCALE;
-      Serial.print("Y scale set to: ");
-      Serial.println((float)scaleY_fixed / FIXED_SCALE);
-      break;
-      
-    case 'm':  // Delay setting ms
-      msDelay = readIntFromSerial();
-      Serial.print("ms Delay set to: ");
-      Serial.println(msDelay);
-      break;
-      
-    case 'u':  // Delay setting us
-      usDelay = readIntFromSerial();
-      Serial.print("us Delay set to: ");
-      Serial.println(usDelay);
-      break;
-
-    case '^':  // Y shift
-      centreY = constrain(centreY + readIntFromSerial(), 0, 4095);
-      Serial.print("Y centre: ");
-      Serial.println(centreY);
-      break;
-      
-    case '>':  // X shift
-      centreX = constrain(centreX + readIntFromSerial(), 0, 4095);
-      Serial.print("X centre: ");
-      Serial.println(centreX);
-      break;
-      
-    default:
-      Serial.print("Unknown command: ");
-      Serial.println(command);
+      scan_base_pointer = 0; 
+      singleRunRemaining = steps;
+      currentMode = MODE_SCAN;
+      Serial.print("Running "); Serial.print(steps); Serial.println(" steps.");
+    }
+    else if (cmd == 'm') {
+      idx++;
+      long val = 0;
+      while(idx < len && isDigit(data[idx])) {
+        val = val * 10 + (data[idx] - '0');
+        idx++;
+      }
+      msDelay = val;
+      Serial.print("ms Delay set to: "); Serial.println(msDelay);
+    }
+    else if (cmd == 'u') {
+      idx++;
+      long val = 0;
+      while(idx < len && isDigit(data[idx])) {
+        val = val * 10 + (data[idx] - '0');
+        idx++;
+      }
+      usDelay = val;
+      Serial.print("us Delay set to: "); Serial.println(usDelay);
+    }
+    else if (cmd == 'x') {
+      idx++;
+      String floatStr = "";
+      while(idx < len && (isDigit(data[idx]) || data[idx]=='.' || data[idx]=='-')) {
+        floatStr += data[idx];
+        idx++;
+      }
+      if (floatStr.length() > 0) {
+        scaleX_fixed = floatStr.toFloat() * FIXED_SCALE;
+        Serial.print("X scale set to: "); Serial.println((float)scaleX_fixed / FIXED_SCALE);
+      }
+    }
+    else if (cmd == 'y') {
+      idx++;
+      String floatStr = "";
+      while(idx < len && (isDigit(data[idx]) || data[idx]=='.' || data[idx]=='-')) {
+        floatStr += data[idx];
+        idx++;
+      }
+      if (floatStr.length() > 0) {
+        scaleY_fixed = floatStr.toFloat() * FIXED_SCALE;
+        Serial.print("Y scale set to: "); Serial.println((float)scaleY_fixed / FIXED_SCALE);
+      }
+    }
+    else if (cmd == '^') {
+      idx++;
+      long val = 0; bool neg=false;
+      if (idx < len && data[idx]=='-') { neg=true; idx++; }
+      while(idx < len && isDigit(data[idx])) {
+        val = val * 10 + (data[idx] - '0');
+        idx++;
+      }
+      if (neg) val = -val;
+      centreY = constrain(centreY + val, 0, 4095);
+      Serial.print("Y centre: "); Serial.println(centreY);
+      if (currentMode == MODE_FIXED) {
+        writeDACs(centreX, centreY);
+        digitalWrite(TRIGGER_PIN, HIGH);
+        delayMicroseconds(12);
+        digitalWrite(TRIGGER_PIN, LOW);
+      }
+    }
+    else if (cmd == '>') {
+      idx++;
+      long val = 0; bool neg=false;
+      if (idx < len && data[idx]=='-') { neg=true; idx++; }
+      while(idx < len && isDigit(data[idx])) {
+        val = val * 10 + (data[idx] - '0');
+        idx++;
+      }
+      if (neg) val = -val;
+      centreX = constrain(centreX + val, 0, 4095);
+      Serial.print("X centre: "); Serial.println(centreX);
+      if (currentMode == MODE_FIXED) {
+        writeDACs(centreX, centreY);
+        digitalWrite(TRIGGER_PIN, HIGH);
+        delayMicroseconds(12);
+        digitalWrite(TRIGGER_PIN, LOW);
+      }
+    }
+    else if (cmd == 'f') { Serial.println("Full waveform/spiral"); isFullWaveform = true; idx++; }
+    else if (cmd == 't') { Serial.println("Trunc waveform/sine"); isFullWaveform = false; idx++; }
+    else if (cmd == 'h') { printHelp(); idx++; }
+    else {
+      idx++; // skip unknown
+    }
   }
 }
 
-
-void setCenterPosition() {
-  digitalWrite(TRIGGER_PIN, HIGH);
-  dac1.write(centreY);
-  dac2.write(centreX);
-  digitalWrite(TRIGGER_PIN, LOW);
-  Serial.println("Laser at Center, press 'q' to exit");
-  waitForQuit();
+void printHelp() {
+  Serial.println("--- DAC Firmware ---");
+  Serial.println("s/s<val>   - Run single cycle or cycles up to <val> steps");
+  Serial.println("o          - Run infinite scanning");
+  Serial.println("c/q        - Stop scanning and return to center");
+  Serial.println("p/p<val>   - Normal TIRF position (Fixed), <val> sets Y scale");
+  Serial.println("f          - Full waveform/spiral");
+  Serial.println("t          - Truncated waveform/sine");
+  Serial.println("x<val>     - X scaling factor (e.g. x1.0)");
+  Serial.println("y<val>     - Y scaling factor (e.g. y1.0)");
+  Serial.println("><val>     - Shift X center (e.g. >10)");
+  Serial.println("^<val>     - Shift Y center (e.g. ^-10)");
+  Serial.println("m<val>     - Delay ms (e.g. m10)");
+  Serial.println("u<val>     - Delay us (e.g. u100)");
+  Serial.println("h          - Print this help message");
+  Serial.println("--------------------");
 }
-
-void setTIRFPosition() {
-  // Calculate TIRF position (max X, center Y)
-  uint16_t tirfX = computeDACValue(4095, scaleX_fixed, centreX);
-  
-  digitalWrite(TRIGGER_PIN, HIGH);
-  dac1.write(centreY);
-  dac2.write(tirfX);
-  digitalWrite(TRIGGER_PIN, LOW);
-  Serial.println("Laser at TIRF position, press 'q' to exit");
-  waitForQuit();
-}
-
-void waitForQuit() {
-  while(Serial.read() != 'q');  // Wait for 'q'
-  Serial.println("Exiting fixed position");
-}
-
-float readFloatFromSerial() {
-  String input;
-  while(!Serial.available());  // Wait for data
-  delay(10);  // Allow buffer to fill
-  
-  while(Serial.available()) {
-    char c = Serial.read();
-    if(c == '\n' || c == '\r') break;
-    if(isDigit(c) || c == '.' || c == '-') input += c;
-  }
-  return input.toFloat();
-}
-
-int readIntFromSerial() {
-  String input;
-  while(!Serial.available());  // Wait for data
-  delay(10);  // Allow buffer to fill
-  
-  while(Serial.available()) {
-    char c = Serial.read();
-    if(c == '\n' || c == '\r') break;
-    if(isDigit(c) || c == '-') input += c;
-  }
-  return input.toInt();
-}
-
-/* Memory Optimization Notes:
- * - Base waveforms stored in PROGMEM (flash) instead of RAM
- * - Fixed-point arithmetic replaces floating-point calculations
- * - On-the-fly computation eliminates need for output buffers
- * - 310 samples * 2 bytes * 2 buffers = 1240 bytes saved
- * - Total RAM reduction: ~1240 bytes (61% of 2048)
- */
